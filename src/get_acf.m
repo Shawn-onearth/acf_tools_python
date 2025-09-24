@@ -454,6 +454,11 @@ if fit_ap
             idx_while_loop{k} = 1;          
         end
     end    
+    
+    % check if there any any NaNs 
+    if any(isnan(ap_linear(:)))
+        warning('There are NaNs in the aperiodic estimate for some reason (maybe the input data gas been brutally high-pass filtered??')
+    end
 
 end
 
