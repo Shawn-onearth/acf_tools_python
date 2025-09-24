@@ -96,13 +96,22 @@ z_meter_rel = mean(subsref(z, subs_cmd), ndims(acf));
 % acf ratio 
 ratio_meter_rel = acf_mean_meter_rel ./ acf_mean_meter_unrel;
 
+% log-ratio 
+log_ratio_meter_rel = log10(ratio_meter_rel); 
+
 % acf contrast 
 contrast_meter_rel = (acf_mean_meter_rel-acf_mean_meter_unrel) ./ ...
                      (acf_mean_meter_rel+acf_mean_meter_unrel); 
 
+% difference 
+diff_meter_rel = acf_mean_meter_rel - acf_mean_meter_unrel;
+
+                 
 feat = []; 
+feat.diff_meter_rel = diff_meter_rel; 
 feat.z_meter_rel = z_meter_rel; 
 feat.ratio_meter_rel = ratio_meter_rel; 
+feat.log_ratio_meter_rel = log_ratio_meter_rel; 
 feat.contrast_meter_rel = contrast_meter_rel; 
 feat.vals = acf_vals; 
 
