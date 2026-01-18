@@ -1,3 +1,0 @@
-addpath(genpath('../src'))
-
-runtests

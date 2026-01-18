@@ -31,8 +31,7 @@ def get_acf(x: np.ndarray,
             fs: float,
             rm_ap: bool = False,
             fit_ap: bool = False,
-            irasa_h: Tuple[int, int] = (1, 32),
-            ap_fit_flims: Optional[Tuple[float, float]] = None,
+            band_low: float = 0.1,
             normalize_x: bool = False,
             force_x_positive: bool = False,
             normalize_acf_to_1: bool = True,
@@ -85,8 +84,6 @@ def get_acf(x: np.ndarray,
             1/f分量(线性幅度)
         'x_norm' : np.ndarray, shape=(channel, time) or None
             1/f去除后的时间序列
-        'X_norm' : np.ndarray, shape=(channel, N) or None
-            1/f去除后的完整复数频谱
         'irasa_ap' : np.ndarray or None
             IRASA估计的1/f幅度谱 (channel, freq)
     """
@@ -107,12 +104,7 @@ def get_acf(x: np.ndarray,
     n_channels, n_time = x.shape
     N = n_time
     
-    if ap_fit_flims is None:
-        ap_fit_flims = (1.0, fs / 2)
-    
-    # 确保band不超过Nyquist频率
-    band_high = min(ap_fit_flims[1], fs / 2 - 0.1)
-    band_low = max(ap_fit_flims[0], 0.5)
+
     
     # 时间域预处理
     if normalize_x:
@@ -127,13 +119,20 @@ def get_acf(x: np.ndarray,
     hN = N // 2 + 1  # 单边谱的长度
     
     # 频率数组
-    freq = np.arange(hN) / N * fs
+    freq = np.fft.rfftfreq(N, d=1/fs)
     
-    # FFT: (channel, N) -> (channel, N)
-    X = np.fft.fft(x, axis=-1) / N * 2
-    
-    # 幅度谱 (channel, hN)
-    mX = np.abs(X[:, :hN])
+    # FFT
+    X_UNMODIFIED = np.fft.rfft(x)
+    X = np.fft.rfft(x) / N  # 归一化FFT
+
+
+    #对于奇数N，最后一个不是nyquist，也需要乘以二；对于偶数N，最后一个是nyquist，不乘以2
+    if N%2 ==1:
+        X[:,1:] *= 2
+    else :
+        X[:,1:-1] *= 2 
+
+
     
     # Lag数组 (秒)
     lags = np.arange(hN) / fs
@@ -143,6 +142,15 @@ def get_acf(x: np.ndarray,
     irasa_ap = None
     X_norm = None
     x_norm = None
+    osc_psd = None
+    osc_freqs = None
+    fit_params = None
+    X_ap_vecs = None
+    x_ap_vecs = None
+
+    band_high = fs/4
+    print(f"对于irasa，有效的估计最大到fs/4 = {band_high} Hz")
+
     
     # ========== 1/f拟合 (使用YASA的IRASA) ==========
     if fit_ap:
@@ -151,71 +159,86 @@ def get_acf(x: np.ndarray,
         
         ap_linear = np.zeros((n_channels, hN))
         irasa_ap = np.zeros((n_channels, hN))
-        
+        nbins = (band_high - band_low) // 0.25 +1
+        osc_psds = np.zeros((n_channels, int(nbins)))
+        osc_freqs = np.zeros((n_channels, int(nbins)))
+
         for ch in range(n_channels):
             if verbose:
                 print(f"  通道 {ch+1}/{n_channels}")
+
+            # YASA的IRASA接收时域信号
+            # winsec默认4秒
+            freqs, ap_psd, osc_psd, fit_params = irasa(x[ch], sf=fs, 
+                                            band=(band_low, band_high),
+                                            hset = [1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55, 1.6, 1.65, 1.7, 1.75, 1.8, 1.85, 1.9],
+                                            win_sec=4,
+                                            return_fit=True,
+                                            verbose=False)
+
+            # yasa 0.6.5 irasa returns (1, freqs) even for 1D input
+            if ap_psd.ndim == 2:
+                ap_psd = ap_psd.flatten()
             
-            try:
-                # YASA的IRASA接收时域信号
-                # 返回 (freq_array, ap_psd, osc_psd) 当 return_fit=False
-                h_range = list(np.arange(irasa_h[0], irasa_h[1] + 0.01, 0.05))
-                # 限制band上限，避免超过Nyquist频率的警告
-                band_high_safe = min(band_high, fs / 2 - 1)
-                freqs, ap_psd, osc_psd = irasa(x[ch], sf=fs, 
-                                               band=(band_low, band_high_safe),
-                                               hset=h_range, 
-                                               return_fit=False,
-                                               verbose=False)
-                
-                # 插值到我们的频率分辨率
-                ap_psd_interp = np.interp(freq, freqs, ap_psd, 
-                                          left=ap_psd[0], right=ap_psd[-1])
-                
-                # 转换为幅度
-                ap_linear[ch] = np.sqrt(np.abs(ap_psd_interp))
-                irasa_ap[ch] = np.sqrt(np.abs(ap_psd_interp))
-                
-                if verbose > 1:
-                    print(f"    IRASA 1/f提取完成 (freq范围: {freqs[0]:.1f}-{freqs[-1]:.1f} Hz)")
-                
-            except Exception as e:
-                warnings.warn(f"通道 {ch} IRASA拟合失败: {e}")
-                ap_linear[ch] = np.ones(hN)  # 回退到平坦谱
-                irasa_ap[ch] = np.ones(hN)
+            # 插值到我们的频率分辨率
+            # 先把freq限制在band_high之内
+            freq_mask = (freq > 0 ) & (freq <= band_high)
+            freq_to_fit = freq[freq_mask]
+            
+            ap_psd_interp = np.interp(freq_to_fit, freqs, ap_psd)
+            
+            if freqs[0] != 0:
+                # 在0 Hz处补0
+                ap_psd_interp = np.concatenate(([0], ap_psd_interp))
+                freq_to_fit = np.concatenate(([0], freq_to_fit))
+
+            # 补全到hN长度
+            if len(ap_psd_interp) < hN:
+                n_missing = hN - len(ap_psd_interp)
+                ap_psd_interp = np.concatenate((
+                    ap_psd_interp,
+                    np.zeros(n_missing)
+                ))
+            
+            # 转换为幅度
+            #yasa用的是welch，返回的是1/f的PSD (Density, V^2/Hz)
+            # 我们需要将其转换为对应全长信号FFT的幅度谱 (X, Volts)
+            # 关系: |X|^2 = 2 * PSD * df (where df = fs/N)
+            # 所以 |X| = sqrt(2 * fs / N * PSD)
+            #注意我们已经在PSD上插值了，因此频率分辨率fs/N就是X的分辨率，就是1/信号总时长
+            
+            scaling_factor = 2 * fs / N
+            ap_linear[ch] = np.sqrt(ap_psd_interp * scaling_factor)
+            
+            irasa_ap[ch] =  ap_psd_interp
+            osc_psds[ch] = osc_psd
+            osc_freqs[ch]= freqs
+            #fit_params[ch] = fit_params
+            
+            if verbose > 1:
+                print(f"    IRASA 1/f提取完成 (freq范围: {freqs[0]:.1f}-{freqs[-1]:.1f} Hz)")
+            
+
     
-    # ========== 1/f降噪 ==========
+    # ========== 在频域删除1/f降噪==========
     if rm_ap and ap_linear is not None:
         if verbose:
             print("执行1/f降噪...")
         
-        # 处理DC分量(频率0 Hz处的无穷大)
+        # 保持DC (通常为0)
         ap_for_norm = ap_linear.copy()
-        ap_for_norm[:, 0] = 1  # 保持DC不变
-        
-        # 镜像1/f分量以获得完整谱(包含负频率)
-        if N % 2 == 0:
-            # 偶数长度: [0, 1,..., N/2, ..., N-1]
-            ap_whole_spect = np.concatenate([
-                ap_for_norm,
-                ap_for_norm[:, -2:0:-1]  # 反向，从N/2-1到1
-            ], axis=-1)
-        else:
-            # 奇数长度: [0, 1,..., (N-1)/2, ..., N-1]
-            ap_whole_spect = np.concatenate([
-                ap_for_norm,
-                ap_for_norm[:, -1:0:-1]  # 反向，从hN-1到1
-            ], axis=-1)
-        
+        ap_for_norm[:, 0] = 0 
+
         # 降噪: 从X中减去估计的1/f
-        mX_whole_spect = np.abs(X)
-        mX_whole_spect[mX_whole_spect == 0] = 1  # 避免除以0
+        mX_half_spect = np.abs(X)
+        mX_half_spect[mX_half_spect == 0] = 1  # 避免除以0
         
-        # X的单位向量，因为除以了
-        X_norm_vecs = X / mX_whole_spect
+        # 频率分量除以模长，等于相位， X/|X|
+        X_norm_vecs = X / mX_half_spect
         
-        # 1/f向量
-        X_ap_vecs = X_norm_vecs * ap_whole_spect
+        # 1/f向量，用相位乘以1/f的幅度
+        ap_half_spect = ap_for_norm
+        X_ap_vecs = X_norm_vecs * ap_half_spect
         
         # 初始化降噪后的X
         X_norm = X.copy()
@@ -226,6 +249,8 @@ def get_acf(x: np.ndarray,
         
         # 减去1/f分量
         X_norm[~mask_dont_touch] = X[~mask_dont_touch] - X_ap_vecs[~mask_dont_touch]
+
+
     else:
         X_norm = X.copy()
     
@@ -235,7 +260,7 @@ def get_acf(x: np.ndarray,
     
     # Wiener-Khintchin定理: ACF = IFFT(|X|²)
     # (channel, N) -> (channel, N)
-    acf_full = np.fft.ifft(X_norm * np.conj(X_norm), axis=-1).real
+    acf_full = np.fft.irfft(X_norm * np.conj(X_norm), axis=-1,n=N)
     
     # 截取到hN (只需lag 0到N/2)
     acf = acf_full[:, :hN]
@@ -250,53 +275,33 @@ def get_acf(x: np.ndarray,
     
     # 时间域1/f去除信号(可选)
     if get_x_norm and X_norm is not None:
-        x_norm = np.fft.ifft(X_norm, axis=-1).real
+        X_norm = X_norm * N  # 反归一化FFT
+        X_ap_vecs = X_ap_vecs * N  # 反归一化FFT
+        #对于奇数N，最后一个不是nyquist，也需要乘以二；对于偶数N，最后一个是nyquist，不乘以2
+        if N%2 ==1:
+            X_norm[:,1:] /= 2
+            X_ap_vecs[:,1:] /= 2
+        else :
+            X_norm[:,1:-1] /= 2
+            X_ap_vecs[:,1:-1] /= 2
+            
+        x_norm = np.fft.irfft(X_norm, axis=-1,n=N)
+        x_ap_vecs = np.fft.irfft(X_ap_vecs, axis=-1,n=N)
+        
     
     return {
         'acf': acf,
         'lags': lags,
         'freq': freq,
-        'mX': mX,
         'ap_linear': ap_linear,
         'x_norm': x_norm,
         'X_norm': X_norm,
         'irasa_ap': irasa_ap,
+        'osc_psds': osc_psds,
+        'osc_freqs': osc_freqs,
+        'X': X,
+        'X_ap_vecs': X_ap_vecs,
+        'x_ap_vecs': x_ap_vecs,
+        'acf_full': acf_full
     }
 
-
-if __name__ == '__main__':
-    # 简单测试
-    np.random.seed(42)
-    
-    # 生成测试信号: 1/f + 振荡
-    fs = 100
-    N = 1000
-    t = np.arange(N) / fs
-    
-    # 1/f噪声 (pink noise)
-    f = np.fft.fftfreq(N, 1/fs)[:N//2+1]
-    psd = 1 / np.maximum(np.abs(f), 0.1) ** 1.5
-    pink_noise_fft = np.sqrt(psd) * (np.random.randn(N//2+1) + 1j * np.random.randn(N//2+1))
-    pink_noise = np.fft.irfft(pink_noise_fft, n=N)
-    
-    # 加入10 Hz的响应
-    response = 0.5 * np.sin(2 * np.pi * 10 * t)
-    x = pink_noise + response
-    
-    # 测试单通道
-    print("=== 测试单通道 (1, 1000) ===")
-    result = get_acf(x[np.newaxis, :], fs, rm_ap=True, verbose=1)
-    print(f"ACF shape: {result['acf'].shape}")
-    print(f"ACF[0] lag0值: {result['acf'][0, 0]:.4f}")
-    
-    if result['irasa_ap'] is not None:
-        print(f"IRASA提取的1/f: min={result['irasa_ap'][0].min():.3f}, "
-              f"max={result['irasa_ap'][0].max():.3f}")
-    
-    # 测试多通道
-    print("\n=== 测试多通道 (2, 1000) ===")
-    x_multi = np.vstack([x, x * 0.8])
-    result = get_acf(x_multi, fs, rm_ap=True, verbose=1)
-    print(f"ACF shape: {result['acf'].shape}")
-    print(f"ACF[0, 0] (lag=0): {result['acf'][0, 0]:.4f}")
-    print(f"ACF[1, 0] (lag=0): {result['acf'][1, 0]:.4f}")
