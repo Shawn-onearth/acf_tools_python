@@ -158,9 +158,8 @@ def get_acf(x: np.ndarray,
         
         ap_linear = np.zeros((n_channels, hN))
         irasa_ap = np.zeros((n_channels, hN))
-        nbins = (band_high - band_low) // 0.25 +1
-        osc_psds = np.zeros((n_channels, int(nbins)))
-        osc_freqs = np.zeros((n_channels, int(nbins)))
+        # nbins calculation removed as it was causing shape mismatch errors
+        # osc_psds/osc_freqs removed as they are not returned
 
         for ch in range(n_channels):
             if verbose:
@@ -210,8 +209,7 @@ def get_acf(x: np.ndarray,
             ap_linear[ch] = np.sqrt(ap_psd_interp * scaling_factor)
             
             irasa_ap[ch] =  ap_psd_interp
-            osc_psds[ch] = osc_psd
-            osc_freqs[ch]= freqs
+            # osc_psds/osc_freqs assignments removed
             #fit_params[ch] = fit_params
             
             if verbose > 1:
