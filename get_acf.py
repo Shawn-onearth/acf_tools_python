@@ -30,14 +30,16 @@ except ImportError:
 def get_acf(x: np.ndarray, 
             fs: float,
             rm_ap: bool = False,
-            fit_ap: bool = False,
             band_low: float = 0.1,
+            band_high: float = 30.0,
             normalize_x: bool = False,
             force_x_positive: bool = False,
             normalize_acf_to_1: bool = True,
             normalize_acf_z: bool = False,
             verbose: int = 0,
-            get_x_norm: bool = False) -> Dict:
+            acf_half: bool = True
+            ) :
+
     """
     计算自相关函数(ACF)，可选地移除1/f频谱分量
     
@@ -50,8 +52,6 @@ def get_acf(x: np.ndarray,
         采样率(Hz)
     rm_ap : bool, default=False
         是否拟合并移除1/f分量
-    fit_ap : bool, default=False
-        是否拟合1/f(即使不移除)
     irasa_h : tuple, default=(1, 32)
         IRASA: resampling因子范围 (min_h, max_h)
     ap_fit_flims : tuple, optional
@@ -88,7 +88,7 @@ def get_acf(x: np.ndarray,
             IRASA估计的1/f幅度谱 (channel, freq)
     """
     
-    if not HAS_IRASA and (fit_ap or rm_ap):
+    if not HAS_IRASA and rm_ap:
         raise ImportError(
             "需要yasa库进行IRASA 1/f拟合。请安装: pip install yasa"
         )
@@ -108,7 +108,7 @@ def get_acf(x: np.ndarray,
     
     # 时间域预处理
     if normalize_x:
-        x = stats.zscore(x, axis=-1, keepdims=True)
+        x = stats.zscore(x, axis=-1)
     
     if force_x_positive and np.any(x < 0):
         warnings.warn("强制x为正值")
@@ -122,7 +122,6 @@ def get_acf(x: np.ndarray,
     freq = np.fft.rfftfreq(N, d=1/fs)
     
     # FFT
-    X_UNMODIFIED = np.fft.rfft(x)
     X = np.fft.rfft(x) / N  # 归一化FFT
 
 
@@ -136,6 +135,7 @@ def get_acf(x: np.ndarray,
     
     # Lag数组 (秒)
     lags = np.arange(hN) / fs
+    fulllags = np.arange(N) / fs
     
     # 初始化输出
     ap_linear = None
@@ -148,12 +148,11 @@ def get_acf(x: np.ndarray,
     X_ap_vecs = None
     x_ap_vecs = None
 
-    band_high = fs/4
-    print(f"对于irasa，有效的估计最大到fs/4 = {band_high} Hz")
+   
 
     
     # ========== 1/f拟合 (使用YASA的IRASA) ==========
-    if fit_ap:
+    if rm_ap :
         if verbose:
             print(f"拟合1/f分量 (使用YASA IRASA)")
         
@@ -221,7 +220,7 @@ def get_acf(x: np.ndarray,
 
     
     # ========== 在频域删除1/f降噪==========
-    if rm_ap and ap_linear is not None:
+    if rm_ap :
         if verbose:
             print("执行1/f降噪...")
         
@@ -250,58 +249,94 @@ def get_acf(x: np.ndarray,
         # 减去1/f分量
         X_norm[~mask_dont_touch] = X[~mask_dont_touch] - X_ap_vecs[~mask_dont_touch]
 
-
     else:
         X_norm = X.copy()
+        X_ap_vecs = None
+
     
     # ========== 计算ACF ==========
-    if verbose:
-        print("计算ACF...")
-    
-    # Wiener-Khintchin定理: ACF = IFFT(|X|²)
-    # (channel, N) -> (channel, N)
-    acf_full = np.fft.irfft(X_norm * np.conj(X_norm), axis=-1,n=N)
-    
-    # 截取到hN (只需lag 0到N/2)
-    acf = acf_full[:, :hN]
-    
-    # 归一化ACF到[-1, 1]
-    if normalize_acf_to_1:
-        acf = acf / acf[:, 0:1]  # 除以lag=0的值
-    
-    # zscore归一化
-    if normalize_acf_z:
-        acf = stats.zscore(acf, axis=-1, keepdims=True)
-    
-    # 时间域1/f去除信号(可选)
-    if get_x_norm and X_norm is not None:
+    if rm_ap:
+        if verbose:
+            print("计算ACF...")
+        
+        # Wiener-Khintchin定理: ACF = IFFT(|X|²)
+        # (channel, N) -> (channel, N)
+
+        # 1. 减去均值 (Remove DC offset in Frequency Domain)
+        # 频域的第0个分量对应直流分量(DC)，置0即等于时域减去均值
+        X_norm_no_dc = X_norm.copy()
+        X_norm_no_dc[:, 0] = 0
+        
+        acf_circular = np.fft.irfft(X_norm_no_dc * np.conj(X_norm_no_dc), axis=-1, n=N)
+
+        if acf_half ==True:
+            # 截取到hN (只需lag 0到N/2)
+            acf = acf_circular[:, :hN]
+        else:
+            acf = acf_circular
+
+        # 归一化ACF到[-1, 1]
+        if normalize_acf_to_1:
+            acf = acf / acf[:, 0:1]  # 除以lag=0的值
+        
+        # zscore归一化
+        if normalize_acf_z:
+            acf = stats.zscore(acf, axis=-1, keepdims=True)
+        
+        # 时间域1/f去除信号(可选)
+
         X_norm = X_norm * N  # 反归一化FFT
         X_ap_vecs = X_ap_vecs * N  # 反归一化FFT
+        X = X * N
         #对于奇数N，最后一个不是nyquist，也需要乘以二；对于偶数N，最后一个是nyquist，不乘以2
         if N%2 ==1:
             X_norm[:,1:] /= 2
             X_ap_vecs[:,1:] /= 2
+            X[:,1:] /= 2
         else :
             X_norm[:,1:-1] /= 2
             X_ap_vecs[:,1:-1] /= 2
+            X[:,1:-1] /= 2
+
             
         x_norm = np.fft.irfft(X_norm, axis=-1,n=N)
         x_ap_vecs = np.fft.irfft(X_ap_vecs, axis=-1,n=N)
+
+    
+    else:
+        # 未移除1/f，直接计算ACF
+        if verbose:
+            print("计算ACF...")
         
+        # 1. 减去均值 (Remove DC offset in Frequency Domain)
+        X_no_dc = X.copy()
+        X_no_dc[:, 0] = 0
+        
+        acf_circular = np.fft.irfft(X_no_dc * np.conj(X_no_dc), axis=-1, n=N)
+
+        if acf_half ==True:
+            # 截取到hN (只需lag 0到N/2)
+            acf = acf_circular[:, :hN]
+        else:
+            acf = acf_circular
+
+        # 归一化ACF到[-1, 1]
+        if normalize_acf_to_1:
+            acf = acf / acf[:, 0:1]  # 除以lag=0的值
+        
+        # zscore归一化
+        if normalize_acf_z:
+            acf = stats.zscore(acf, axis=-1, keepdims=True)
+        
+        x_norm = None
+        X_norm = None
+        x_ap_vecs = None
     
     return {
         'acf': acf,
-        'lags': lags,
-        'freq': freq,
-        'ap_linear': ap_linear,
+        'lags': lags if acf_half else fulllags,
         'x_norm': x_norm,
         'X_norm': X_norm,
-        'irasa_ap': irasa_ap,
-        'osc_psds': osc_psds,
-        'osc_freqs': osc_freqs,
-        'X': X,
-        'X_ap_vecs': X_ap_vecs,
-        'x_ap_vecs': x_ap_vecs,
-        'acf_full': acf_full
+        'x_ap_vecs':x_ap_vecs
     }
 
