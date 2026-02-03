@@ -1,6 +1,6 @@
 ### `get_acf`
 
-Use IRASA to perform ACF, and optionally return a 1/f–removed time‑domain signal based on the aperiodic elements returned by IRASA.
+Use IRASA to perform ACF on EEG data, and optionally return a 1/f–removed time‑domain signal based on the aperiodic elements returned by IRASA.
 
 Requires: **YASA**
 
@@ -20,3 +20,4 @@ get_acf(
     acf_half: bool = True
 )
 
+input shape is (1, time) or (channel, time).
